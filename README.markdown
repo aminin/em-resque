@@ -1,3 +1,9 @@
+THIS FORK
+=========
+
+This fork is intended to only run one fiber and does not use Fiber yielding to pick up jobs. This fork was created
+because the EM::Synchrony.sleep solution does not work well for sending Apple Push Notifications.
+
 EM::Resque
 ==========
 
@@ -216,7 +222,7 @@ given a string or a Redis object. This means if you're already using
 Redis in your app, EM::Resquec an re-use the existing connection. 
 EM::Resque is using the non-blocking em-redis when given the host as a
 string. If using a Redis object, please use the non-blocking
-EM::Protocols::Redis.
+EM::Hiredis.
 
 String: `EM::Resque::WorkerMachine.new(opts.merge(:redis => 'localhost:6379'))`
 

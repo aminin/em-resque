@@ -12,10 +12,12 @@ context "Worker" do
       worker = EM::Resque::Worker.new('*')
       worker.work(0)
 
-      assert_equal 1, EM::Resque.info[:processed]
+      EM::Timer.new(0.5) do
+        assert_equal 1, EM::Resque.info[:processed]
 
-      worker.shutdown!
-      EM.stop
+        worker.shutdown!
+        EM.stop
+      end
     end
   end
 
@@ -25,10 +27,12 @@ context "Worker" do
       worker = EM::Resque::Worker.new('*')
       worker.work(0)
 
-      assert_equal 1, EM::Resque.redis.get("stat:processed_jobs").to_i
+      EM::Timer.new(0.5) do
+        assert_equal 1, EM::Resque.redis.get("stat:processed_jobs").to_i
 
-      worker.shutdown!
-      EM.stop
+        worker.shutdown!
+        EM.stop
+      end
     end
   end
 
@@ -38,9 +42,11 @@ context "Worker" do
       worker = EM::Resque::Worker.new('*')
       worker.work(0)
 
-      assert_equal 1, Resque::Failure.count
-      worker.shutdown!
-      EM.stop
+      EM::Timer.new(0.5) do
+        assert_equal 1, Resque::Failure.count
+        worker.shutdown!
+        EM.stop
+      end
     end
   end
 end

@@ -16,24 +16,30 @@ module EventMachine
       # signals and prunes dead workers
       #
       # == Options
-      # concurrency::  The number of green threads inside the machine (default 20)
+      # fibers::       The number of fibers to use in the worker (default 1)
       # interval::     Time in seconds how often the workers check for new work
       #                (default 5)
-      # fibers_count:: How many fibers (and workers) to be run inside the
-      #                machine (default 1)
       # queues::       Which queues to poll (default all)
       # verbose::      Verbose log output (default false)
       # vverbose::     Even more verbose log output (default false)
       # pidfile::      The file to save the process id number
+      # tick_instead_of_sleep::      Whether to tick through the reactor polling for jobs or use EM::Synchrony.sleep.
+      #                              Note that if you use this option, you'll be limited to 1 fiber.
       def initialize(opts = {})
-        @concurrency = opts[:concurrency] || 20
         @interval = opts[:interval] || 5
         @fibers_count = opts[:fibers] || 1
         @queues = opts[:queue] || opts[:queues] || '*'
         @verbose = opts[:logging] || opts[:verbose] || false
         @very_verbose = opts[:vverbose] || false
         @pidfile = opts[:pidfile]
+        @redis_namespace = opts[:namespace] || :resque
         @redis_uri = opts[:redis] || "redis://127.0.0.1:6379"
+        @tick_instead_of_sleep = !opts[:tick_instead_of_sleep].nil? ? opts[:tick_instead_of_sleep] : false
+
+        # If we're ticking instead of sleeping, we can only have one fiber
+        if @tick_instead_of_sleep
+          @fibers_count = 1
+        end
 
         raise(ArgumentError, "Should have at least one fiber") if @fibers_count.to_i < 1
 
@@ -45,11 +51,15 @@ module EventMachine
       # Start the machine and start polling queues.
       def start
         EM.synchrony do
-          EM::Resque.initialize_redis(@redis_uri, @fibers_count)
+          EM::Resque.initialize_redis(@redis_uri, @redis_namespace, @fibers_count)
           trap_signals
           prune_dead_workers
           @fibers.each(&:resume)
-          system_monitor.resume
+
+          # If we're ticking and not sleeping, we don't need to monitor for yielding
+          unless @tick_instead_of_sleep
+            system_monitor.resume
+          end
         end
       end
 
@@ -76,6 +86,7 @@ module EventMachine
           worker = EM::Resque::Worker.new(*queues)
           worker.verbose = @verbose
           worker.very_verbose = @very_verbose
+          worker.tick_instead_of_sleep = @tick_instead_of_sleep
 
           worker
         end
