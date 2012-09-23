@@ -1,5 +1,5 @@
 module EventMachine
   module Resque
-    Version = VERSION = '1.1.0'
+    Version = VERSION = '1.1.1'
   end
 end
