@@ -110,7 +110,9 @@ module EventMachine
       # Deletes worker information from Redis if there's now processes for
       # their pids.
       def prune_dead_workers
-        @workers.first.prune_dead_workers if @workers.size > 0
+        # Worker#prune_dead_workers is too synchronous
+        # TODO: make this function asynchronous
+        #@workers.first.prune_dead_workers if @workers.size > 0
       end
 
       # Shuts down the machine if all fibers are dead.

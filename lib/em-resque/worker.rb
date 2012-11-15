@@ -15,6 +15,14 @@ class EventMachine::Resque::Worker < Resque::Worker
     EM::Synchrony.sleep interval
   end
 
+  def verbose_sleep(interval, message, &work_loop)
+    log! "Sleeping for #{interval} seconds"
+    procline message
+    EM::Timer.new(interval) do
+      EM.next_tick(&work_loop)
+    end
+  end
+
   # Overwrite Resque's #work method to allow us to determine whether or not we want to ticks through a reactor
   # instead of using EM::Synchrony sleep.
   #
@@ -42,47 +50,74 @@ class EventMachine::Resque::Worker < Resque::Worker
         next
       end
 
-      if not paused? and job = reserve
-        log "got: #{job.inspect}"
-        job.worker = self
-        run_hook :before_fork, job
-        working_on job
-
-        if @child = fork
-          srand # Reseeding
-          procline "Forked #{@child} at #{Time.now.to_i}"
-          begin
-            Process.waitpid(@child)
-          rescue SystemCallError
-            nil
-          end
-        else
-          unregister_signal_handlers if !@cant_fork && term_child
-          procline "Processing #{job.queue} since #{Time.now.to_i}"
-          redis.client.reconnect # Don't share connection with parent
-          perform(job, &block)
-          exit! unless @cant_fork
-          EM::Timer.new(interval) do
-            EM.next_tick(&work_loop)
-          end
-        end
-
-        done_working
-        @child = nil
-      else
+      if paused?
         break if interval.zero?
-        log! "Sleeping for #{interval} seconds"
-        procline paused? ? "Paused" : "Waiting for #{@queues.join(',')}"
-        EM::Timer.new(interval) do
-          EM.next_tick(&work_loop)
+        verbose_sleep interval, "Paused", &work_loop
+      else
+        reserve_job do |job|
+          if job
+            log "got: #{job.inspect}"
+            job.worker = self
+            run_hook :before_fork, job
+            working_on job
+
+            if @child = fork
+              srand # Reseeding
+              procline "Forked #{@child} at #{Time.now.to_i}"
+              begin
+                Process.waitpid(@child)
+              rescue SystemCallError
+                nil
+              end
+            else
+              unregister_signal_handlers if !@cant_fork && term_child
+              procline "Processing #{job.queue} since #{Time.now.to_i}"
+              redis.client.reconnect # Don't share connection with parent
+              perform(job, &block)
+              exit! unless @cant_fork
+              EM::Timer.new(interval) do
+                EM.next_tick(&work_loop)
+              end
+            end
+            done_working
+            @child = nil
+          else
+            verbose_sleep interval, "Waiting for #{@queues.join(',')}", &work_loop
+          end
         end
       end
     end
     EM.next_tick(&work_loop)
   end
+
+  # Asynchronous analog of Resque::Worker#reserve
+  #
+  # Instead of
+  #
+  #   job = reserve
+  #   # any operations with job
+  #
+  # use
+  #
+  #   reserve_job().callback do |job|
+  #     # any operations with job
+  #   end
+  #
+  # @return [EM::Deferrable]
+  def reserve_job
+    queue = queues.first
+    log! "Checking #{queue}"
+    redis.lpop("queue:#{queue}").callback do |payload|
+      yield payload ? Resque::Job.new(queue, decode(payload)) : nil
+    end
+  rescue Exception => e
+    log "Error reserving job: #{e.inspect}"
+    log e.backtrace.join("\n")
+    raise e
+  end
   
   # Be sure we're never forking
-  def fork
+  def fork(*args)
     nil
   end
 
