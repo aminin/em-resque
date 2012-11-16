@@ -4,6 +4,7 @@ require 'resque'
 # a non-blocking version of sleep. 
 class EventMachine::Resque::Worker < Resque::Worker
   attr_accessor :tick_instead_of_sleep
+  attr_accessor :job
 
   def initialize(*args)
     super(*args)
@@ -15,105 +16,19 @@ class EventMachine::Resque::Worker < Resque::Worker
     EM::Synchrony.sleep interval
   end
 
-  def verbose_sleep(interval, message, &work_loop)
-    log! "Sleeping for #{interval} seconds"
-    procline message
-    EM::Timer.new(interval) do
-      EM.next_tick(&work_loop)
-    end
-  end
-
-  # Overwrite Resque's #work method to allow us to determine whether or not we want to ticks through a reactor
-  # instead of using EM::Synchrony sleep.
-  #
-  # The reason for this option is because when sending push notifications and using 1 fiber, the response from Apple
-  # will come after another job has been finished and is generally unreliable. Note that this means that you can't use
-  # this worker with more than one fiber for push workers.
-  def work(interval = 5.0, &block)
-    if self.tick_instead_of_sleep
-      work_tick(interval, &block)
-    else
-      super(interval, &block)
-    end
-  end
-
-  # Resque::Worker's #work method modified to use EM.next_tick instead of sleep
-  def work_tick(interval, &block)
-    interval = Float(interval)
-    $0 = "resque: Starting"
+  # @param [Resque::Job] job
+  def work_once job, &block
     startup
+    log "got: #{job.inspect}"
+    job.worker = self
+    run_hook :before_fork, job  # do we really need this?
+    working_on job
 
-    work_loop = lambda do
-      if shutdown?
-        unregister_worker
-        EM.stop
-        next
-      end
+    procline "Processing #{job.queue} since #{Time.now.to_i}"
+    perform(job, &block)
 
-      if paused?
-        break if interval.zero?
-        verbose_sleep interval, "Paused", &work_loop
-      else
-        reserve_job do |job|
-          if job
-            log "got: #{job.inspect}"
-            job.worker = self
-            run_hook :before_fork, job
-            working_on job
-
-            if @child = fork
-              srand # Reseeding
-              procline "Forked #{@child} at #{Time.now.to_i}"
-              begin
-                Process.waitpid(@child)
-              rescue SystemCallError
-                nil
-              end
-            else
-              unregister_signal_handlers if !@cant_fork && term_child
-              procline "Processing #{job.queue} since #{Time.now.to_i}"
-              redis.client.reconnect # Don't share connection with parent
-              perform(job, &block)
-              exit! unless @cant_fork
-              EM::Timer.new(interval) do
-                EM.next_tick(&work_loop)
-              end
-            end
-            done_working
-            @child = nil
-          else
-            verbose_sleep interval, "Waiting for #{@queues.join(',')}", &work_loop
-          end
-        end
-      end
-    end
-    EM.next_tick(&work_loop)
-  end
-
-  # Asynchronous analog of Resque::Worker#reserve
-  #
-  # Instead of
-  #
-  #   job = reserve
-  #   # any operations with job
-  #
-  # use
-  #
-  #   reserve_job().callback do |job|
-  #     # any operations with job
-  #   end
-  #
-  # @return [EM::Deferrable]
-  def reserve_job
-    queue = queues.first
-    log! "Checking #{queue}"
-    redis.lpop("queue:#{queue}").callback do |payload|
-      yield payload ? Resque::Job.new(queue, decode(payload)) : nil
-    end
-  rescue Exception => e
-    log "Error reserving job: #{e.inspect}"
-    log e.backtrace.join("\n")
-    raise e
+    done_working
+    unregister_worker
   end
   
   # Be sure we're never forking
@@ -132,7 +47,27 @@ class EventMachine::Resque::Worker < Resque::Worker
   def processed!
     Resque::Stat << "processed"
     Resque::Stat << "processed:#{self}"
-    Resque::Stat << "processed_#{job['queue']}"
+    Resque::Stat << "processed_#{job.queue}"
+    self.job = nil
+  end
+
+  def working_on job
+    self.job = job
+    super(job)
+  end
+
+  def unregister_worker(exception = nil)
+    # If we're still processing a job, make sure it gets logged as a
+    # failure.
+
+    self.job.fail(exception || ::Resque::DirtyExit.new) if self.job
+
+    redis.srem(:workers, self)
+    redis.del("worker:#{self}")
+    redis.del("worker:#{self}:started")
+
+    Resque::Stat.clear("processed:#{self}")
+    Resque::Stat.clear("failed:#{self}")
   end
 
   # The string representation is the same as the id for this worker instance.

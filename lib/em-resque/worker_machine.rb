@@ -12,6 +12,8 @@ module EventMachine
     # workers are shut down.
 
     class WorkerMachine
+      include ::Resque::Helpers
+      extend  ::Resque::Helpers
       # Initializes the machine, creates the fibers and workers, traps quit
       # signals and prunes dead workers
       #
@@ -34,72 +36,95 @@ module EventMachine
         @pidfile = opts[:pidfile]
         @redis_namespace = opts[:namespace] || :resque
         @redis_uri = opts[:redis] || "redis://127.0.0.1:6379"
-        @tick_instead_of_sleep = !opts[:tick_instead_of_sleep].nil? ? opts[:tick_instead_of_sleep] : false
 
-        # If we're ticking instead of sleeping, we can only have one fiber
-        if @tick_instead_of_sleep
-          @fibers_count = 1
-        end
+        @fibers = []
 
         raise(ArgumentError, "Should have at least one fiber") if @fibers_count.to_i < 1
 
-        build_workers
-        build_fibers
         create_pidfile
       end
 
       # Start the machine and start polling queues.
-      def start
+      def start &block
         EM.synchrony do
           EM::Resque.initialize_redis(@redis_uri, @redis_namespace, @fibers_count)
           trap_signals
           prune_dead_workers
-          @fibers.each(&:resume)
 
-          # If we're ticking and not sleeping, we don't need to monitor for yielding
-          unless @tick_instead_of_sleep
-            system_monitor.resume
+          queues = @queues.to_s.split(',')
+          queues.each do |queue|
+            dispatch_queue queue, &block
           end
         end
-      end
-
-      # Stop the machine.
-      def stop
-        @workers.each(&:shutdown)
-      end
-
-      def fibers
-        @fibers || []
-      end
-
-      def workers
-        @workers || []
       end
 
       private
 
-      # Builds the workers to poll the given queues.
-      def build_workers
-        queues = @queues.to_s.split(',')
+      def stop
+        @shutdown = true
+      end
 
-        @workers = (1..@fibers_count.to_i).map do
-          worker = EM::Resque::Worker.new(*queues)
-          worker.verbose = @verbose
-          worker.very_verbose = @very_verbose
-          worker.tick_instead_of_sleep = @tick_instead_of_sleep
+      def dispatch_queue queue, &block
+        work_loop = lambda do
+          if @shutdown
+            EM.stop
+            next
+          end
 
-          worker
+          if active_fibers_count < @fibers_count
+            log! "Checking #{queue}"
+            begin
+              redis.lpop("queue:#{queue}").callback do |payload|
+                if payload
+                  job = ::Resque::Job.new(queue, decode(payload))
+                  worker = spawn_worker
+                  fiber = Fiber.new do
+                    worker.log "starting async worker #{worker}"
+                    worker.work_once job, &block
+                  end
+                  @fibers << fiber
+                  fiber.resume
+                  EM.next_tick &work_loop
+                else
+                  verbose_sleep @interval, "Waiting for #{queue}", &work_loop
+                end
+              end
+            rescue Exception => e
+              log "Error reserving job: #{e.inspect}"
+              log e.backtrace.join("\n")
+              raise e
+            end
+          else
+            verbose_sleep @interval, "All workers are busy", &work_loop
+          end
+        end
+        EM.next_tick &work_loop
+      end
+
+      def active_fibers_count
+        @fibers.reject! { |f| !f.alive? }
+        @fibers.count
+      end
+
+      def verbose_sleep(interval, message, &work_loop)
+        log! "Sleeping for #{interval} seconds"
+        procline message
+        EM::Timer.new(interval) do
+          EM.next_tick(&work_loop)
         end
       end
 
-      # Builds the fibers to contain the built workers.
-      def build_fibers
-        @fibers = @workers.map do |worker|
-          Fiber.new do
-            worker.log "starting async worker #{worker}"
-            worker.work(@interval)
-          end
-        end
+      def spawn_worker
+        queues = @queues.to_s.split(',')
+        worker = EM::Resque::Worker.new(*queues)
+        worker.verbose = @verbose
+        worker.very_verbose = @very_verbose
+        worker
+      end
+
+      def procline(string)
+        $0 = "resque-#{Resque::Version}: #{string}"
+        log! $0
       end
 
       # Traps signals TERM, INT and QUIT to stop the machine.
@@ -110,23 +135,48 @@ module EventMachine
       # Deletes worker information from Redis if there's now processes for
       # their pids.
       def prune_dead_workers
-        # Worker#prune_dead_workers is too synchronous
-        # TODO: make this function asynchronous
-        #@workers.first.prune_dead_workers if @workers.size > 0
+        redis.smembers(:workers).callback do |all_workers|
+          known_workers = worker_pids unless all_workers.empty?
+          all_workers.each do |worker_id|
+            host, pid, queues, fiber_id = worker_id.split(':')
+            next unless host == hostname
+            next if known_workers.include?(pid)
+            log! "Pruning dead worker: #{worker_id}"
+            queues = queues.split(',')
+            worker = EM::Resque::Worker.new(*queues)
+            worker.to_s = worker_id
+            worker.unregister_worker
+          end
+        end
       end
 
-      # Shuts down the machine if all fibers are dead.
-      def system_monitor
-        Fiber.new do
-          loop do
-            EM.stop unless fibers.any?(&:alive?)
-            EM::Synchrony.sleep 1
-          end
+      def hostname
+        @hostname ||= `hostname`.chomp
+      end
+
+      def worker_pids
+        `ps -A -o pid,command | grep "[r]esque" | grep -v "resque-web"`.split("\n").map do |line|
+          line.split(' ')[0]
         end
       end
 
       def create_pidfile
         File.open(@pidfile, 'w') { |f| f << Process.pid } if @pidfile
+      end
+
+      # Log a message to STDOUT if we are verbose or very_verbose.
+      def log(message)
+        if @verbose
+          puts "*** #{message}"
+        elsif @very_verbose
+          time = Time.now.strftime('%H:%M:%S %Y-%m-%d')
+          puts "** [#{time}] #$$: #{message}"
+        end
+      end
+
+      # Logs a very verbose message to STDOUT.
+      def log!(message)
+        log message if @very_verbose
       end
     end
   end
