@@ -6,34 +6,20 @@ class EventMachine::Resque::Worker < Resque::Worker
   attr_accessor :tick_instead_of_sleep
   attr_accessor :job
 
-  def initialize(*args)
-    super(*args)
-    self.tick_instead_of_sleep = false
-  end
-
-  # Overwrite system sleep with the non-blocking version
-  def sleep(interval)
-    EM::Synchrony.sleep interval
+  def free?
+    job.nil?
   end
 
   # @param [Resque::Job] job
   def work_once job, &block
-    startup
     log "got: #{job.inspect}"
     job.worker = self
-    run_hook :before_fork, job  # do we really need this?
     working_on job
 
     procline "Processing #{job.queue} since #{Time.now.to_i}"
     perform(job, &block)
 
     done_working
-    unregister_worker
-  end
-  
-  # Be sure we're never forking
-  def fork(*args)
-    nil
   end
 
   # Simpler startup
@@ -48,6 +34,12 @@ class EventMachine::Resque::Worker < Resque::Worker
     Resque::Stat << "processed"
     Resque::Stat << "processed:#{self}"
     Resque::Stat << "processed_#{job.queue}"
+  end
+
+  # Called when we are done working - clears our `working_on` state
+  # and tells Redis we processed a job.
+  def done_working
+    super
     self.job = nil
   end
 
@@ -73,7 +65,7 @@ class EventMachine::Resque::Worker < Resque::Worker
   # The string representation is the same as the id for this worker instance.
   # Can be used with Worker.find
   def to_s
-    "#{super}:#{Fiber.current.object_id}"
+    "#{super}:#{object_id}"
   end
   alias_method :id, :to_s
 end

@@ -1,9 +1,3 @@
-THIS FORK
-=========
-
-This fork is intended to only run one fiber and does not use Fiber yielding to pick up jobs. This fork was created
-because the EM::Synchrony.sleep solution does not work well for sending Apple Push Notifications.
-
 EM::Resque
 ==========
 

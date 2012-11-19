@@ -11,9 +11,7 @@ module EventMachine
     # EventMachine. The monitoring takes care of stopping the machine when all
     # workers are shut down.
 
-    class WorkerMachine
-      include ::Resque::Helpers
-      extend  ::Resque::Helpers
+    class WorkerMachine < ::Resque::Worker
       # Initializes the machine, creates the fibers and workers, traps quit
       # signals and prunes dead workers
       #
@@ -28,19 +26,21 @@ module EventMachine
       # tick_instead_of_sleep::      Whether to tick through the reactor polling for jobs or use EM::Synchrony.sleep.
       #                              Note that if you use this option, you'll be limited to 1 fiber.
       def initialize(opts = {})
-        @interval = opts[:interval] || 5
-        @fibers_count = opts[:fibers] || 1
-        @queues = opts[:queue] || opts[:queues] || '*'
-        @verbose = opts[:logging] || opts[:verbose] || false
-        @very_verbose = opts[:vverbose] || false
-        @pidfile = opts[:pidfile]
+        @interval        = opts[:interval]  || 5
+        @fibers_count    = opts[:fibers]    || 1
+        @queues          = opts[:queue]     || opts[:queues] || '*'
+        @verbose         = opts[:logging]   || opts[:verbose] || false
+        @very_verbose    = opts[:vverbose]  || false
+        @pidfile         = opts[:pidfile]
         @redis_namespace = opts[:namespace] || :resque
-        @redis_uri = opts[:redis] || "redis://127.0.0.1:6379"
+        @redis_uri       = opts[:redis]     || "redis://127.0.0.1:6379"
 
-        @fibers = []
+        @queues = @queues.to_s.split(',')
 
         raise(ArgumentError, "Should have at least one fiber") if @fibers_count.to_i < 1
 
+        build_workers
+        build_fibers
         create_pidfile
       end
 
@@ -48,20 +48,59 @@ module EventMachine
       def start &block
         EM.synchrony do
           EM::Resque.initialize_redis(@redis_uri, @redis_namespace, @fibers_count)
+
           trap_signals
           prune_dead_workers
+          run_hook :before_first_fork
 
-          queues = @queues.to_s.split(',')
-          queues.each do |queue|
+          @queues.each do |queue|
             dispatch_queue queue, &block
           end
         end
       end
 
-      private
-
       def stop
         @shutdown = true
+        @workers.map(&:unregister_worker)
+      end
+
+      def workers
+        @workers ||= []
+      end
+
+      def fibers
+        @fibers ||= {}
+      end
+
+      private
+
+      def free_worker_fiber
+        free_worker = @workers.detect { |worker| worker.free? }
+        @fibers[free_worker.object_id]
+      end
+
+      def build_workers
+        @workers ||= []
+
+        @workers = (1..@fibers_count.to_i).map do
+          worker = EM::Resque::Worker.new(*@queues)
+          worker.startup
+          worker.verbose = @verbose
+          worker.very_verbose = @very_verbose
+          worker
+        end
+      end
+
+      def build_fibers
+        @fibers ||= {}
+        @workers.each do |worker|
+          @fibers[worker.object_id] = Fiber.new do |job|
+            while true
+              worker.work_once job
+              job = Fiber.yield
+            end
+          end
+        end
       end
 
       def dispatch_queue queue, &block
@@ -71,19 +110,15 @@ module EventMachine
             next
           end
 
-          if active_fibers_count < @fibers_count
+          worker_fiber = free_worker_fiber
+
+          if worker_fiber
             log! "Checking #{queue}"
             begin
               redis.lpop("queue:#{queue}").callback do |payload|
                 if payload
                   job = ::Resque::Job.new(queue, decode(payload))
-                  worker = spawn_worker
-                  fiber = Fiber.new do
-                    worker.log "starting async worker #{worker}"
-                    worker.work_once job, &block
-                  end
-                  @fibers << fiber
-                  fiber.resume
+                  worker_fiber.resume job
                   EM.next_tick &work_loop
                 else
                   verbose_sleep @interval, "Waiting for #{queue}", &work_loop
@@ -114,14 +149,6 @@ module EventMachine
         end
       end
 
-      def spawn_worker
-        queues = @queues.to_s.split(',')
-        worker = EM::Resque::Worker.new(*queues)
-        worker.verbose = @verbose
-        worker.very_verbose = @very_verbose
-        worker
-      end
-
       def procline(string)
         $0 = "resque-#{Resque::Version}: #{string}"
         log! $0
@@ -150,33 +177,8 @@ module EventMachine
         end
       end
 
-      def hostname
-        @hostname ||= `hostname`.chomp
-      end
-
-      def worker_pids
-        `ps -A -o pid,command | grep "[r]esque" | grep -v "resque-web"`.split("\n").map do |line|
-          line.split(' ')[0]
-        end
-      end
-
       def create_pidfile
         File.open(@pidfile, 'w') { |f| f << Process.pid } if @pidfile
-      end
-
-      # Log a message to STDOUT if we are verbose or very_verbose.
-      def log(message)
-        if @verbose
-          puts "*** #{message}"
-        elsif @very_verbose
-          time = Time.now.strftime('%H:%M:%S %Y-%m-%d')
-          puts "** [#{time}] #$$: #{message}"
-        end
-      end
-
-      # Logs a very verbose message to STDOUT.
-      def log!(message)
-        log message if @very_verbose
       end
     end
   end

@@ -7,7 +7,7 @@ context 'WorkerMachine' do
 
     assert_equal 1, machine.fibers.count
     assert_equal 1, machine.workers.count
-    assert_equal Fiber, machine.fibers.first.class
+    assert_equal Fiber, machine.fibers[machine.workers.first.object_id].class
     assert_equal EM::Resque::Worker, machine.workers.first.class
   end
 

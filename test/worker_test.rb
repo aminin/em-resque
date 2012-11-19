@@ -21,6 +21,11 @@ context "Worker" do
     end
   end
 
+  test "to_s generates proper string representation" do
+    worker = EM::Resque::Worker.new(*%w(foo bar baz))
+    assert /[\w-]+:\d+:foo,bar,baz:\d+/ =~ worker.to_s
+  end
+
   test "logs the processed queue" do
     EM.synchrony do
       EM::Resque.enqueue(TestJob, 420, 'test processed')
